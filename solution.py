@@ -64,7 +64,21 @@ MONEY_RE = re.compile(r"\$([\d,]+(?:\.\d{2})?)")
 MONTHS_RE = re.compile(r"(\d+)\s*[- ]?months?\b", re.I)
 WORD_NUM = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
             "seven": 7, "eight": 8, "nine": 9, "ten": 10, "twelve": 12,
-            "eighteen": 18, "twenty-four": 24, "thirty-six": 36, "sixty": 60}
+            "fifteen": 15, "seventeen": 17, "eighteen": 18, "twenty": 20,
+            "twenty-four": 24, "thirty": 30, "thirty-six": 36,
+            "forty-eight": 48, "sixty": 60, "seventy-two": 72,
+            "eighty-four": 84}
+# longest first, so "twenty-four" is replaced before "twenty"
+_WORD_NUM_RE = re.compile(
+    r"\b(" + "|".join(sorted(WORD_NUM, key=len, reverse=True)) +
+    r")(?=[\s\-]+(?:months?|years?)\b)", re.I)
+
+
+def _digits_for_words(s):
+    """'thirty-year' -> '30-year', 'seventeen month' -> '17 month': spelled
+    terms become the digits every qualifier parser below expects. Only a
+    number word directly before 'month'/'year' is touched."""
+    return _WORD_NUM_RE.sub(lambda m: str(WORD_NUM[m.group(1).lower()]), s or "")
 
 
 def _clean(s):
@@ -214,6 +228,24 @@ def _month_date(s):
         return date(int(m.group(3)), MONTH_NUM[m.group(1).lower()], int(m.group(2)))
     except ValueError:
         return None
+
+
+def _is_product_heading(label, context):
+    """True when a table row's label is only a balance tier ("$25,000 -
+    $99,999.99") and the line above the table is a short product name
+    ("Investor's Choice") rather than a marketing sentence."""
+    c = _clean(context or "")
+    return bool(re.match(r"\s*\$", label or "") and c
+                and len(c) <= 40 and not re.search(r"[.!?:,]$|^[\$\d]", c))
+
+
+def _uniq_disp(fs):
+    """Distinct values among facts, compared by number, not by text:
+    "12.50% - 19.50%" and "12.50% - 19.50% APR" are one value."""
+    out = {}
+    for f in fs:
+        out.setdefault(f.value, f.disp)
+    return sorted(out.values())
 
 
 def _fmt_date(d):
@@ -375,7 +407,10 @@ class Fact:
         # "$832,750" and "$832750" spellings of the same tier still match.
         q = self.quals
         disp = re.sub(r"[^a-z0-9]", "", (self.display or "").lower())
-        return (self.product, self.metric, disp,
+        # business and personal accounts are different products even when
+        # a row carries the same name ("Share Savings" on /business-rates)
+        biz = bool(q.get("biz")) or "business" in (self.url or "").lower()
+        return (self.product, self.metric, disp, biz,
                 q.get("term"), q.get("years"), q.get("balance"),
                 q.get("amount"), q.get("kind"))
 
@@ -388,7 +423,8 @@ class Knowledge:
         self.branches = []         # (city, address, zip, url, snap, taken, quote)
         self.located = []          # branch addresses from "located at ..." prose
         self.hours = []            # (kind, schedule text, url, snap, taken)
-        self.counts = []           # (n, url, snap, taken, sentence) "N branch office locations"
+        self.counts = []           # (n, url, snap, taken, sentence, pub date) "N branch office locations"
+        self._cur_pub = None       # publication date of the page being ingested
         self.conditions = []       # footnote conditions: {kind, fee_words, value,
                                    #   text, product, display, url, snap, taken}
         self.page_urls = set()     # every ingested page URL (for link answers)
@@ -407,6 +443,8 @@ class Knowledge:
 
     def _ingest_page(self, url, title, md, sid, taken):
         auth = _authority(url)
+        # first full date on the page: a newsroom release's dateline
+        self._cur_pub = _month_date(md)
         lines = md.split("\n")
         heading = title or ""
         context = ""           # last meaningful non-table line (product names live here)
@@ -472,7 +510,10 @@ class Knowledge:
     def _scan_prose(self, url, sid, taken, auth, txt):
         m = re.search(r"(\d+)\s+branch office locations", txt, re.I)
         if m:
-            self.counts.append((int(m.group(1)), url, sid, taken, _raw(txt)))
+            # the page's own publication date (the release dateline): the
+            # count from the newest release is the current one
+            self.counts.append((int(m.group(1)), url, sid, taken, _raw(txt),
+                                self._cur_pub))
         # hours blocks: "Lobby Monday-Thursday: 8:30 a.m.-5 p.m. ... Drive-up ..."
         for kind in ("Lobby", "Drive-up"):
             for mm in re.finditer(kind + r"\b(.{0,400})", txt, re.I):
@@ -891,12 +932,20 @@ class Knowledge:
             return "ira"
         if "savings" in s:
             return "savings"
+        # a bare tier label ("$25,000 - $99,999.99") is not a product: the
+        # product is named on the line above the table ("Investor's Choice")
+        if _is_product_heading(label, context):
+            return _clean(context).lower()[:60]
         return _clean(label).lower()[:60]
 
     @staticmethod
     def _display_name(label, context, section):
         if label and label.lower() != "standard":
             name = _clean(label)
+            # a bare tier row is named after its product ("Investor's
+            # Choice $25,000 - $99,999.99"), not after the balance alone
+            if _is_product_heading(name, context):
+                name = f"{_clean(context)} {name}"
         else:
             name = _clean(context or section)
         # the /rates card table labels the standard row "Platinum Visa Rate"
@@ -921,8 +970,13 @@ class Knowledge:
                 "conflict_note": a.conflict_note}
 
     def _answer(self, question, as_of=None):
-        q = question or ""
+        q = _digits_for_words(question or "")
         ql = q.lower()
+        # an as_of passed as a timestamp ("2026-05-31T00:00:00") is the date
+        # part; snapshot dates are compared as ISO strings
+        if as_of:
+            m = re.match(r"\s*(\d{4}-\d{2}-\d{2})", str(as_of))
+            as_of = m.group(1) if m else None
         eff_as_of = as_of or self._date_in_question(ql)
         if eff_as_of == "AMBIGUOUS":
             return _refuse_note(
@@ -987,13 +1041,18 @@ class Knowledge:
                 return a
 
         # 3. branch address / hours
-        if "branch" in ql or "lobby" in ql or "drive-up" in ql or "drive up" in ql:
+        if ("branch" in ql or "lobby" in ql
+                or re.search(r"drive[\s\-]?(up|thru|through)", ql)
+                or (re.search(r"\b(office|location)\b", ql)
+                    and re.search(r"\b(address|where|located|hours|open)\b", ql))):
             a = self._answer_branch(ql, eff_as_of, q)
             if a:
                 return a
 
         # 4. how many branches
-        if re.search(r"how many (dupaco )?branches", ql):
+        if re.search(r"\b(how many|number of|count of)\b[^?]*?"
+                     r"\b(branch(es)?|branch locations?|locations|offices)\b", ql) \
+                and "atm" not in ql:
             a = self._answer_branch_count(eff_as_of)
             if a:
                 return a
@@ -1151,6 +1210,19 @@ class Knowledge:
         if "last year" in ql and self.snaps:
             year = int(self.snaps[0][1][:4]) - 1
             return f"{year}-12-31"
+        # a full calendar date ("May 20, 2026", "2026-05-20", "5/20/2026")
+        # is checked first: its month name must not be mistaken for a bare,
+        # ambiguous month below. A model year never looks like this.
+        d = _month_date(ql) or _parse_date(ql)
+        if d:
+            return d.isoformat()
+        m = re.search(r"\b(20\d\d)-(\d{2})-(\d{2})\b", ql)
+        if m:
+            try:
+                return date(int(m.group(1)), int(m.group(2)),
+                            int(m.group(3))).isoformat()
+            except ValueError:
+                pass
         # a bare month name with no year ("in May", "as of June") is
         # ambiguous: it could be any year's May. The caller treats the
         # AMBIGUOUS marker as a refusal, never as a current value.
@@ -1161,11 +1233,6 @@ class Knowledge:
         if re.search(r"\b(?:as of|in)\s+(" + "|".join(months) +
                      r")\b(?!\s+20\d\d)", ql):
             return "AMBIGUOUS"
-        # a full calendar date ("January 1, 2020") is a date the question
-        # is actually about — not a model year, which never looks like this
-        d = _month_date(ql)
-        if d:
-            return d.isoformat()
         m = re.search(r"as of\s+([a-z]+)\s+(20\d\d)", ql)
         months = {"january": "01", "february": "02", "march": "03", "april": "04",
                   "may": "05", "june": "06", "july": "07", "august": "08",
@@ -1268,8 +1335,9 @@ class Knowledge:
         evs = self._events("routing", as_of)
         if not evs:
             return None
-        # the cash-management page is the expected source; the number
-        # agrees across the contact / checking / cash-management pages
+        # the number agrees across the contact / checking / cash-management
+        # pages; the cash-management page states it most directly
+        # ("routing number" next to the wire and ACH instructions)
         pref = [e for e in evs
                 if e["url"].rstrip("/").endswith("/business/cash-management")]
         e = pref[0] if pref else evs[0]
@@ -1361,10 +1429,11 @@ class Knowledge:
         branch' -> {'mineral', 'point'}; 'branch in Cedar Rapids' ->
         city 'Cedar Rapids'.) Returns (tokens, city) — either may be empty."""
         name = None
-        m = re.search(r"([A-Za-z]+(?:\s+[A-Za-z]+){0,2})\s+branch\b", q, re.I)
+        m = re.search(r"([A-Za-z]+(?:\s+[A-Za-z]+){0,2})\s+(?:branch|office|location)\b",
+                      q, re.I)
         if m:
             toks = {_stem(w) for w in re.findall(r"[A-Za-z]+", m.group(1))
-                    if w.lower() not in self._BRANCH_NAME_STOP}
+                    if w.lower() not in self._BRANCH_NAME_STOP and len(w) > 1}
             if toks:
                 name = toks
         city = None
@@ -1408,7 +1477,7 @@ class Knowledge:
         named = bool(name_toks or city)
         if "phone" in ql and named:
             return self._answer_branch_phone(name_toks, city, ql)
-        if "address" in ql:
+        if "address" in ql or re.search(r"\bwhere is\b|\blocated\b", ql):
             if named:
                 rec, _kind = self._match_branch(name_toks, city)
                 if rec is None:
@@ -1428,7 +1497,7 @@ class Knowledge:
             # an unnamed "branch address" question with no city cannot be
             # answered from one entry; fall through to the prose fallback
             return None
-        if "hours" in ql:
+        if "hours" in ql or re.search(r"\bwhen\b[^?]*\bopen\b|\bwhat time\b", ql):
             if named:
                 # branch-specific hours only: the segment (or its page URL)
                 # must name the branch. General hours are never a substitute
@@ -1444,9 +1513,24 @@ class Knowledge:
                     "hours for that branch are not listed on the website.")
             # general hours — rendered from the extracted hours segments
             # (the learning-lab release's typical schedule), not a fixed
-            # string; the branch directory is cited too, as the eval expects
+            # string; the branch directory is cited too, because hours vary
+            # by branch and that page is where a member finds their own
             lobby = self._best_hours("lobby")
             drive = self._best_hours("drive-up")
+            # a drive-up question gets the drive-up schedule only
+            if drive and re.search(r"drive[\s\-]?(up|thru|through)", ql) \
+                    and "lobby" not in ql:
+                srcs = [Source(url=drive[2], snapshot_id=drive[3],
+                               quote=_raw(drive[1]))]
+                contact = self._page_url("/contact")
+                if contact:
+                    self._add_srcs(srcs, [Source(
+                        url=contact, snapshot_id=self._latest_snap(),
+                        quote=self._page_quote(contact, ["branch"]))])
+                return Answer(
+                    text=f"{self._hours_text(drive[1], 'drive-up')}. "
+                         "Drive-up hours can vary by branch.",
+                    sources=srcs)
             if lobby and drive:
                 lobby_txt = self._hours_text(lobby[1], "lobby")
                 drive_txt = self._hours_text(drive[1], "drive-up")
@@ -1498,6 +1582,8 @@ class Knowledge:
 
     @staticmethod
     def _hours_text(seg, kind):
+        # markdown markers off first: "**ABOUT DUPACO" must still be cut
+        seg = _clean(seg)
         if kind == "lobby":
             seg = re.split(r"Drive-up", seg, flags=re.I)[0]
         # the captured window runs past the hours into the boilerplate
@@ -1508,15 +1594,35 @@ class Knowledge:
     def _answer_branch_count(self, as_of=None):
         if self._predates(as_of):
             return _refuse_note("that information is not available for that date.")
+        c = self._current_count(as_of)
+        if c is None:
+            return None
+        return Answer(text=f"Dupaco has {c[0]} branch office locations.",
+                      sources=[Source(url=c[1], snapshot_id=c[2],
+                                      quote=c[4] or "")])
+
+    def _current_count(self, as_of=None):
+        """The branch count from the most recently published release in the
+        snapshot visible at as_of. Old releases stay on the site with the
+        count they were written with (19, 20, 23, 24...); the newest
+        dateline is the current figure. With as_of, releases published after
+        that date are not yet known."""
         if not self.counts:
             return None
-        # newest snapshot wins; press releases in the newest snapshot agree on 22
-        newest = max(c[3] for c in self.counts)
-        vals = [c for c in self.counts if c[3] == newest]
-        n = vals[-1][0]
-        return Answer(text=f"Dupaco has {n} branch office locations.",
-                      sources=[Source(url=vals[-1][1], snapshot_id=vals[-1][2],
-                                      quote=vals[-1][4] or "")])
+        if as_of:
+            ok = [s for s, t in self.snaps if t <= as_of]
+            snap = ok[-1] if ok else self.snaps[0][0]
+        else:
+            snap = self.snaps[-1][0]
+        pool = [c for c in self.counts if c[2] == snap] or list(self.counts)
+        if as_of:
+            try:
+                d = date.fromisoformat(as_of)
+                dated = [c for c in pool if c[5] is None or c[5] <= d]
+                pool = dated or pool
+            except ValueError:
+                pass
+        return max(pool, key=lambda c: (c[5] or date(1900, 1, 1), c[3]))
 
     def _answer_hyvee(self, ql, as_of):
         evs = self._events("hyvee", as_of)
@@ -1615,7 +1721,8 @@ class Knowledge:
             stems = {_stem(w) for w in words
                      if len(w) > 1 and not w.isdigit()
                      and w not in self._PHRASE_STOP
-                     and w not in ("model", "vehicle", "auto")}
+                     and w not in ("model", "vehicle", "auto", "car", "cars",
+                                   "truck", "suv")}
             if stems:
                 return stems
             return self._phrase_after_product(ql, m)
@@ -1704,13 +1811,24 @@ class Knowledge:
                 if re.search(rf"\b{w}\s+month", ql):
                     terms.append(n)
         year = None
-        m = re.search(r"(20\d\d)[\s\-]?(?:model[\s\-]?year|vehicle)", ql)
+        m = re.search(r"(20\d\d)[\s\-]?(?:model[\s\-]?year|vehicle|car|truck"
+                      r"|suv|motorcycle|model)\b", ql)
         if m:
             year = int(m.group(1))
+        # a loan or deposit term in years ("5-year", "3 years"); one or two
+        # digits only, so a model year (2025) is never read as a term
         yr = None
-        m = re.search(r"(\d+)[\s\-]?year", ql)
-        if m and "model" not in ql and "vehicle" not in ql:
+        m = re.search(r"(?<!\d)(\d{1,2})[\s\-]?years?\b", ql)
+        if m:
             yr = int(m.group(1))
+        # auto, personal, boat/RV loans and certificates publish their terms
+        # in months: "5-year auto loan" is the 60-month row. Mortgages and
+        # home equity publish theirs in years and keep the year qualifier.
+        if yr is not None and not terms and prod in (
+                "auto loan", "personal loan", "recreational loan",
+                "certificate"):
+            terms = [yr * 12]
+            yr = None
         balance = None
         bm = re.findall(r"\$([\d,]+)", ql)
         if bm and ("balance" in ql or "between" in ql or "savings" in ql or "checking" in ql):
@@ -2172,6 +2290,10 @@ class Knowledge:
             # row for that term; no term named: show the full APY list
             if not qualified or "jumbo" not in ql:
                 return self._render_list(prod, rows, facts, with_min=with_min)
+        # an auto question that names the model year but not the term has
+        # one row per term: list them all rather than pick one term silently
+        if prod == "auto loan" and len({f.quals.get("term") for f in rows}) > 1:
+            return self._render_list(prod, rows, facts, with_min=with_min)
         if qualified and prod == "mortgage":
             tiers = {(f.quals.get("amount"), f.quals.get("yr")) for f in rows}
             if len(tiers) > 1:
@@ -2424,6 +2546,11 @@ class Knowledge:
                 continue
             if must_words and not all(w in txt.lower() for w in must_words):
                 continue
+            # an open question answered from a blog post must be about
+            # Dupaco: blog posts profile other organisations too ("their
+            # current CEO retiring"), and that is not a fact about Dupaco
+            if not must_words and auth <= 30 and "dupaco" not in txt.lower():
+                continue
             matched = distinctive & toks
             if not matched:
                 continue
@@ -2474,6 +2601,11 @@ class Knowledge:
                 scored.append((n, s))
         scored.sort(key=lambda x: -x[0])
         keep = [s for _n, s in scored[:2]]
+        # "how many / how much" asks for a number: a passage without one
+        # does not answer it, however many words it shares
+        if re.search(r"\bhow (many|much)\b", ql) and \
+                not re.search(r"\d", " ".join(keep)):
+            return None
         text = _clean(" ".join(keep))[:600]
         return Answer(text=text,
                       sources=[Source(url=url, snapshot_id=sid,
@@ -2497,18 +2629,25 @@ class Knowledge:
         # The structural conflicts go first: the list is capped, and these
         # are the ones the site's own releases disagree about most clearly.
         # 1. branch count
-        vals = {str(n) for n, _, _, _, _ in self.counts}
+        vals = {str(c[0]) for c in self.counts}
         if len(vals) > 1:
-            # same rule as the branch-count answer: the last count recorded
-            # in the newest snapshot (the newest releases agree on 22)
-            newest = max(c[3] for c in self.counts)
-            n = [c for c in self.counts if c[3] == newest][-1][0]
-            others = sorted(v for v in vals if v != str(n))
-            add("Number of Dupaco branch office locations", sorted(vals),
-                [Source(url=c[1], snapshot_id=c[2], quote=c[4] or "")
-                 for c in self.counts[:6]],
-                str(n),
-                f"Older releases say {', '.join(others)}; the newest releases say {n}.")
+            # same rule as the branch-count answer: the most recently
+            # published release in the newest snapshot
+            cur = self._current_count()
+            n = cur[0]
+            others = sorted((v for v in vals if v != str(n)), key=int)
+            # one source per distinct value, newest release of each
+            srcs = []
+            for v in sorted(vals, key=int):
+                cs = [c for c in self.counts if str(c[0]) == v]
+                c = max(cs, key=lambda c: (c[5] or date(1900, 1, 1), c[3]))
+                srcs.append(Source(url=c[1], snapshot_id=c[2], quote=c[4] or ""))
+            when = _fmt_date(cur[5]) if cur[5] else "the newest release"
+            add("Number of Dupaco branch office locations",
+                sorted(vals, key=int), srcs, str(n),
+                f"Older newsroom releases stay on the site with the count they "
+                f"were written with ({', '.join(others)}); the most recently "
+                f"published release ({when}) says {n}.")
         # 2. Forbes ordinal: newest release wins
         ords = {}
         for (url, sid, taken, auth, txt, _t, _ex) in self.chunks:
@@ -2531,17 +2670,28 @@ class Knowledge:
         auto = [f for f in self.facts if f.product == "auto loan" and f.metric == "apr"]
         for term in sorted({f.quals.get("term") for f in auto if f.quals.get("term")}):
             rows = [f for f in auto if f.quals.get("term") == term]
-            vals = {f.disp for f in rows}
+            vals = _uniq_disp(rows)
             if len(vals) > 1:
-                winner = max(rows, key=lambda f: (f.auth, f.taken,
-                                                  f.eff or date(1900, 1, 1)))
-                add(f"Auto loan APR, {term}-month term",
-                    sorted(vals),
-                    [Source(url=f.url, snapshot_id=f.snap, quote=f.row or "")
-                     for f in rows[:6]],
-                    winner.disp,
-                    "The auto-loan rate page is authoritative; the vehicle-affordability "
-                    "calculator and promo pages still show the old rate.")
+                # the model-year bands roll forward (2023-26 -> 2024-27), and
+                # promo / checking pages keep the old band and its old rate.
+                # The current value is the newest band on the most
+                # authoritative page of the newest snapshot.
+                def band_end(f):
+                    return (f.quals.get("years") or (0, 0))[1]
+                top = band_end(self._resolve(rows, extra=band_end)[0])
+                # explain against the rows that compete with the winning
+                # band: other bands on a rate page are other tiers, not rivals
+                winner, reason = self._resolve(
+                    [f for f in rows if f.auth < 95 or band_end(f) == top],
+                    extra=band_end)
+                if any(f.auth < 95 and 0 < band_end(f) < top for f in rows):
+                    reason += (" Lower-authority pages still list older "
+                               "model-year bands with their old rates.")
+                yrs = winner.quals.get("years")
+                band_txt = f" ({yrs[0]}-{str(yrs[1])[2:]} model years)" if yrs else ""
+                add(f"Auto loan APR, {term}-month term{band_txt}",
+                    sorted(vals), self._conflict_sources(rows, winner),
+                    winner.disp, reason)
         # 4. rate facts that disagree for the same product/tier/metric
         by_key = {}
         for f in self.facts:
@@ -2550,32 +2700,104 @@ class Knowledge:
             if ("intro" in f.display.lower()
                     or "balance transfer" in f.display.lower()):
                 continue
+            # a row whose product could not be identified cannot be said to
+            # disagree with anything: skip it rather than report a nameless
+            # "conflict"
+            if re.match(r"[\$\d]", f.product or ""):
+                continue
             by_key.setdefault(f.key(), []).append(f)
         for key, fs in by_key.items():
             vals = {}
             for f in fs:
-                vals.setdefault(f.disp, []).append(f)
+                vals.setdefault(f.value, []).append(f)
             if len(vals) < 2:
                 continue
-            prod = fs[0].product
+            # one page showing two values under one label in one snapshot
+            # is two rows of one table (two cards both labelled "Variable
+            # Interest Rate"), not the site contradicting itself
+            per_page = {}
+            for f in fs:
+                per_page.setdefault((f.url, f.snap), set()).add(f.value)
+            if any(len(v) > 1 for v in per_page.values()):
+                continue
             term = fs[0].quals.get("term")
             yrs = fs[0].quals.get("years")
             topic = fs[0].display
-            if term:
+            # a bare tier label ("$25,000 - $99,999.99") names no product:
+            # put the product (its section heading) in front of it
+            if re.match(r"[\$\d]", topic or "") and \
+                    fs[0].product.lower() not in topic.lower():
+                topic = f"{fs[0].product.title()} {topic}"
+            if term and f"{term} month" not in topic.lower():
                 topic += f" ({term}-month)"
-            if yrs:
+            if yrs and "model year" not in topic.lower():
                 topic += f" ({yrs[0]}-{yrs[1]} model years)"
-            # the current value wins: highest authority, then newest
-            # snapshot, then newest "rates effective as of" date
-            winner = max(fs, key=lambda f: (f.auth, f.taken,
-                                            f.eff or date(1900, 1, 1)))
-            srcs = [Source(url=f.url, snapshot_id=f.snap, quote=f.row or "")
-                    for f in fs[:6]]
-            add(topic, sorted(vals), srcs, winner.disp,
-                f"{winner.url} is authoritative and newest; older pages and "
-                f"calculators still show the old value.")
+            topic += {"apy": " APY", "apr": " APR", "div": " dividend rate",
+                      "rate": " rate"}.get(fs[0].metric, "")
+            winner, reason = self._resolve(fs)
+            add(topic, _uniq_disp(fs), self._conflict_sources(fs, winner),
+                winner.disp, reason)
         self._conflicts = out[:40]
         return self._conflicts
+
+    _AUTH_LABEL = {100: "the /rates page", 95: "the product's rate page",
+                   80: "a dupaco.com page", 50: "an outside page",
+                   40: "a calculator or promotional page",
+                   30: "a blog or newsroom post", 20: "a PDF"}
+
+    def _resolve(self, fs, extra=None):
+        """Pick the current value among disagreeing facts and say why.
+        Rate pages (the /rates hub and the product rate pages) outrank every
+        other kind of page; among them the newest snapshot wins, then the
+        page's own authority and effective date. A promo, calculator or blog
+        value is only used when no rate page ever carried the fact: promo
+        pages keep showing an offer long after the rate pages moved on (or
+        renamed the row), so a newer promo does not beat an older rate page."""
+        def cls(f):
+            return 2 if f.auth >= 95 else (1 if f.auth >= 80 else 0)
+        winner = max(fs, key=lambda f: (cls(f), f.taken, f.auth,
+                                        f.eff or date(1900, 1, 1),
+                                        extra(f) if extra else 0))
+        label = self._AUTH_LABEL.get(winner.auth, "a dupaco.com page")
+        lab = lambda f: self._AUTH_LABEL.get(f.auth, "another page")
+        reason = (f"{label[0].upper()}{label[1:]} ({winner.url}) in the "
+                  f"{winner.taken} snapshot shows {winner.disp}.")
+        same = [f for f in fs if f.taken == winner.taken and f.value != winner.value]
+        if same:
+            kinds = sorted({lab(f) for f in same})
+            rank = (f"{label} outranks {' and '.join(kinds)}"
+                    if any(f.auth < winner.auth for f in same)
+                    else "these pages rank equally, so this pick is low-confidence")
+            reason += (f" In the same snapshot {', '.join(sorted({f.url for f in same})[:3])} "
+                       f"show {', '.join(_uniq_disp(same))}; {rank}.")
+        older = _uniq_disp([f for f in fs if f.taken < winner.taken
+                            and cls(f) == cls(winner) and f.value != winner.value])
+        if older:
+            reason += f" Earlier snapshots showed {', '.join(older)}."
+        newer = [f for f in fs if f.taken > winner.taken and f.value != winner.value]
+        if newer:
+            reason += (f" Later snapshots show {', '.join(_uniq_disp(newer))} "
+                       f"only on {' and '.join(sorted({lab(f) for f in newer}))} "
+                       f"({', '.join(sorted({f.url for f in newer})[:3])}); the rate "
+                       f"pages no longer list this row under this name, so "
+                       f"those values are not treated as current.")
+        if cls(winner) == 0:
+            reason += (" No rate page ever carried this, so the value comes "
+                       "from a lower-authority page.")
+        return winner, reason
+
+    @staticmethod
+    def _conflict_sources(fs, winner):
+        """The winning fact plus one source for each competing value."""
+        srcs = [Source(url=winner.url, snapshot_id=winner.snap,
+                       quote=winner.row or "")]
+        seen = {winner.value}
+        for f in sorted(fs, key=lambda f: f.taken, reverse=True):
+            if f.value in seen:
+                continue
+            seen.add(f.value)
+            srcs.append(Source(url=f.url, snapshot_id=f.snap, quote=f.row or ""))
+        return srcs[:6]
 
 
 def build():
